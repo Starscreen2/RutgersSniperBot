@@ -13,7 +13,7 @@ from typing import Optional
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 SQL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "snipes.db")
 RUTGERS_API_URL = "https://sis.rutgers.edu/soc/api/courses.json?year=2025&term=7&campus=NB"
-SCAN_INTERVAL = 2  # Check every 2 seconds
+SCAN_INTERVAL = 1  # Check continuously
 
 # Global cache for courses
 COURSE_CACHE = {"timestamp": 0, "data": None}
@@ -58,13 +58,15 @@ async def initialize_storage():
                 UNIQUE(discord_id, index_number)
             )
         """)
-        # Create the user_configs table if it doesn't exist (without notif_limit)
+        # Create the user_configs table if it doesn't exist (including notif_limit and tts_enabled)
         c.execute("""
             CREATE TABLE IF NOT EXISTS user_configs (
                 discord_id TEXT PRIMARY KEY,
                 max_snipes INTEGER DEFAULT 10,
                 banned INTEGER DEFAULT 0,
-                is_mod INTEGER DEFAULT 0
+                is_mod INTEGER DEFAULT 0,
+                notif_limit INTEGER DEFAULT 5,
+                tts_enabled INTEGER DEFAULT 0
             )
         """)
         # Check if notif_limit column exists; if not, add it.
@@ -72,18 +74,20 @@ async def initialize_storage():
         columns = [row[1] for row in c.fetchall()]
         if "notif_limit" not in columns:
             c.execute("ALTER TABLE user_configs ADD COLUMN notif_limit INTEGER DEFAULT 5")
+        if "tts_enabled" not in columns:
+            c.execute("ALTER TABLE user_configs ADD COLUMN tts_enabled INTEGER DEFAULT 0")
         conn.commit()
 
 def get_user_config(discord_id):
     """Retrieve or create a default config for the given user."""
     with sqlite3.connect(SQL_FILE) as conn:
         c = conn.cursor()
-        c.execute("SELECT max_snipes, banned, is_mod, notif_limit FROM user_configs WHERE discord_id = ?", (discord_id,))
+        c.execute("SELECT max_snipes, banned, is_mod, notif_limit, tts_enabled FROM user_configs WHERE discord_id = ?", (discord_id,))
         row = c.fetchone()
         if row is None:
-            c.execute("INSERT INTO user_configs (discord_id, max_snipes, banned, is_mod, notif_limit) VALUES (?, 10, 0, 0, 5)", (discord_id,))
+            c.execute("INSERT INTO user_configs (discord_id, max_snipes, banned, is_mod, notif_limit, tts_enabled) VALUES (?, 10, 0, 0, 5, 0)", (discord_id,))
             conn.commit()
-            return (10, 0, 0, 5)
+            return (10, 0, 0, 5, 0)
         return row
 
 #########################################
@@ -128,7 +132,7 @@ def get_course_name(index_number):
 
 async def add_snipe(discord_id, index_number):
     # Check user config and banned status
-    max_snipes, banned, is_mod, notif_limit = get_user_config(discord_id)
+    max_snipes, banned, is_mod, notif_limit, tts_enabled = get_user_config(discord_id)
     if int(banned) == 1:
         return "banned"
     # Enforce snipes limit (unless admin or mod)
@@ -163,15 +167,16 @@ async def notify_users(index_number):
         users = c.fetchall()
 
         for user_id, sent_count in users:
-            # Retrieve the user's notification limit from their config
-            _, _, _, notif_limit = get_user_config(user_id)
+            # Retrieve the user's notification limit and TTS preference
+            _, _, _, notif_limit, tts_enabled = get_user_config(user_id)
             if sent_count < notif_limit:
                 try:
                     user = await bot.fetch_user(int(user_id))
                     if user:
                         course_name = get_course_name(index_number)
                         await user.send(
-                            f"🔔 {user.mention}, the course **{course_name}** (index {index_number}) is now OPEN! (Notification {sent_count + 1}/{notif_limit})"
+                            f"🔔 {user.mention}, the course **{course_name}** (index {index_number}) is now OPEN! (Notification {sent_count + 1}/{notif_limit})",
+                            tts=(tts_enabled == 1)
                         )
                         print(f"✅ Sent DM to user {user_id} (#{sent_count+1})")
                 except discord.HTTPException as e:
@@ -219,23 +224,26 @@ async def check_courses():
                         print(f"✅ Course {index_number} is OPEN! Notifying users...")
                         await notify_users(index_number)
 
-                    # Global admin sniping: notify only if a course just transitioned from closed to open.
+                    # Global admin sniping: notify on state changes.
                     if GLOBAL_SNIPING_ENABLED:
                         course_key = str(index_number)
                         current_open = (status == "TRUE")
-                        prev_open = ADMIN_GLOBAL_LAST_OPEN_STATUS.get(course_key, False)
-                        if not prev_open and current_open:
+                        prev_open = ADMIN_GLOBAL_LAST_OPEN_STATUS.get(course_key, None)
+                        if prev_open is None:
+                            ADMIN_GLOBAL_LAST_OPEN_STATUS[course_key] = current_open
+                        elif prev_open != current_open:
                             try:
                                 admin_user = await bot.fetch_user(int(ADMIN_ID))
                                 course_name = get_course_name(index_number)
-                                await admin_user.send(f"🌐 Global Snipe Alert: **{course_name}** (Index: {index_number}) just opened!")
-                                print(f"✅ Notified admin about course {index_number}")
+                                state = "opened" if current_open else "closed"
+                                await admin_user.send(
+                                    f"🌐 Global Snipe Alert: **{course_name}** (Index: {index_number}) just {state}!"
+                                )
+                                print(f"✅ Notified admin about course {index_number} state change to {state}.")
                             except Exception as e:
                                 print(f"❌ Failed to notify admin for course {index_number}: {e}")
-                        # Update the state for next iteration
-                        ADMIN_GLOBAL_LAST_OPEN_STATUS[course_key] = current_open
-
-            # If admin scan notifications are enabled, send a DM (at most once per cooldown period)
+                            ADMIN_GLOBAL_LAST_OPEN_STATUS[course_key] = current_open
+            # Admin scan notification (if enabled)
             if ADMIN_SCAN_NOTIFY:
                 now = time.time()
                 if now - ADMIN_SCAN_LAST_NOTIFIED >= ADMIN_SCAN_NOTIFY_COOLDOWN:
@@ -264,10 +272,7 @@ async def get_admin_status_message():
         active_snipes_count = c.fetchone()[0]
 
     last_scan_time = COURSE_CACHE["timestamp"]
-    if last_scan_time:
-        last_scan_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_scan_time))
-    else:
-        last_scan_str = "Never"
+    last_scan_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_scan_time)) if last_scan_time else "Never"
 
     open_sections = 0
     courses = get_cached_courses()
@@ -276,10 +281,9 @@ async def get_admin_status_message():
             if str(section.get("openStatus")).strip().upper() == "TRUE":
                 open_sections += 1
 
-    # Get the current RAM usage (in MB)
     process = psutil.Process(os.getpid())
     mem_usage_mb = process.memory_info().rss / (1024 * 1024)
-    artificial_mem_mb = len(allocated_memory)  # each block is ~1 MB
+    artificial_mem_mb = len(allocated_memory)
 
     status_message = (
         f"**Bot Status:**\n"
@@ -295,15 +299,12 @@ async def get_admin_status_message():
 
 #########################################
 # Helper: Fetch a user from an identifier
-# (accepts either a user ID or a username)
 #########################################
 
 async def fetch_user_by_identifier(user_identifier: str) -> Optional[discord.User]:
     try:
-        # Try interpreting the identifier as a user ID
         return await bot.fetch_user(int(user_identifier))
     except ValueError:
-        # If not an ID, try searching through guild members by username
         for guild in bot.guilds:
             member = guild.get_member_named(user_identifier)
             if member:
@@ -318,7 +319,6 @@ async def fetch_user_by_identifier(user_identifier: str) -> Optional[discord.Use
 async def snipe(interaction: discord.Interaction, index_number: str):
     result = await add_snipe(str(interaction.user.id), index_number)
     course_name = get_course_name(index_number)
-
     if result is True:
         await interaction.response.send_message(f"✅ {interaction.user.mention}, you'll be notified when **{course_name}** (index {index_number}) opens!")
     elif result == "duplicate":
@@ -335,7 +335,6 @@ async def my_snipes(interaction: discord.Interaction):
         c = conn.cursor()
         c.execute("SELECT DISTINCT index_number FROM snipes WHERE discord_id = ?", (str(interaction.user.id),))
         snipes = [row[0] for row in c.fetchall()]
-
     if snipes:
         snipes_list = [f"({get_course_name(index_num)})" for index_num in snipes]
         snipes_str = ", \n".join(snipes_list)
@@ -364,17 +363,27 @@ remove_snipe.dm_permission = True
 
 @bot.tree.command(name="set_notif_limit", description="Set the number of notifications you'll receive per course (default is 5).")
 async def set_notif_limit(interaction: discord.Interaction, limit: int):
-    # Enforce a reasonable limit range, e.g., 1 to 20.
     if limit < 1 or limit > 20:
         await interaction.response.send_message("❌ Please choose a notification limit between 1 and 20.", ephemeral=True)
         return
     with sqlite3.connect(SQL_FILE) as conn:
         c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO user_configs (discord_id, max_snipes, banned, is_mod, notif_limit) VALUES (?, 10, 0, 0, ?)", (str(interaction.user.id), limit))
+        c.execute("INSERT OR IGNORE INTO user_configs (discord_id, max_snipes, banned, is_mod, notif_limit, tts_enabled) VALUES (?, 10, 0, 0, ?, 0)", (str(interaction.user.id), limit))
         c.execute("UPDATE user_configs SET notif_limit = ? WHERE discord_id = ?", (limit, str(interaction.user.id)))
         conn.commit()
     await interaction.response.send_message(f"✅ {interaction.user.mention}, your notification limit has been set to {limit} per course.", ephemeral=True)
 set_notif_limit.dm_permission = True
+
+# New command: Toggle TTS for open section notifications
+@bot.tree.command(name="set_tts", description="Toggle TTS for open section notifications (default off).")
+async def set_tts(interaction: discord.Interaction, enable: bool):
+    with sqlite3.connect(SQL_FILE) as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO user_configs (discord_id, max_snipes, banned, is_mod, notif_limit, tts_enabled) VALUES (?, 10, 0, 0, 5, ?)", (str(interaction.user.id), int(enable)))
+        c.execute("UPDATE user_configs SET tts_enabled = ? WHERE discord_id = ?", (int(enable), str(interaction.user.id)))
+        conn.commit()
+    await interaction.response.send_message(f"✅ {interaction.user.mention}, TTS for open section notifications has been {'enabled' if enable else 'disabled'}.", ephemeral=True)
+set_tts.dm_permission = True
 
 @bot.tree.command(name="commands", description="List available commands.")
 async def commands_help(interaction: discord.Interaction):
@@ -385,8 +394,9 @@ async def commands_help(interaction: discord.Interaction):
 /remove_snipe <index_number> → Remove a specific snipe.
 /clear_snipes                → Remove all your snipes.
 /set_notif_limit <limit>     → Set the number of notifications you'll receive per course.
+/set_tts <enable>            → Toggle TTS for open section notifications (true/false).
 ```
-Default notifications per course: 5. You can change this with /set_notif_limit. 🚀
+Default notifications per course: 5. 🚀
     """
     await interaction.response.send_message(help_message)
 commands_help.dm_permission = True
@@ -462,7 +472,7 @@ async def admin_edit_limit(interaction: discord.Interaction, member: discord.Use
         if row and row[0] == 1:
             await interaction.response.send_message("❌ Cannot change limit for a mod; they have unlimited snipes.", ephemeral=True)
             return
-        c.execute("INSERT OR IGNORE INTO user_configs (discord_id, max_snipes, banned, is_mod, notif_limit) VALUES (?, 10, 0, 0, 5)", (str(member.id),))
+        c.execute("INSERT OR IGNORE INTO user_configs (discord_id, max_snipes, banned, is_mod, notif_limit, tts_enabled) VALUES (?, 10, 0, 0, 5, 0)", (str(member.id),))
         c.execute("UPDATE user_configs SET max_snipes = ? WHERE discord_id = ?", (limit, str(member.id)))
         conn.commit()
     await interaction.response.send_message(f"✅ Set snipes limit for {member.mention} to {limit}.", ephemeral=True)
@@ -485,7 +495,7 @@ async def admin_ban(interaction: discord.Interaction, user_identifier: str, mess
         return
     with sqlite3.connect(SQL_FILE) as conn:
         c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO user_configs (discord_id, max_snipes, banned, is_mod, notif_limit) VALUES (?, 10, 0, 0, 5)", (str(user.id),))
+        c.execute("INSERT OR IGNORE INTO user_configs (discord_id, max_snipes, banned, is_mod, notif_limit, tts_enabled) VALUES (?, 10, 0, 0, 5, 0)", (str(user.id),))
         c.execute("UPDATE user_configs SET banned = 1 WHERE discord_id = ?", (str(user.id),))
         conn.commit()
     await interaction.response.send_message(f"✅ Banned {user.mention}.", ephemeral=True)
@@ -505,7 +515,7 @@ async def admin_unban(interaction: discord.Interaction, user_identifier: str):
         return
     with sqlite3.connect(SQL_FILE) as conn:
         c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO user_configs (discord_id, max_snipes, banned, is_mod, notif_limit) VALUES (?, 10, 0, 0, 5)", (str(user.id),))
+        c.execute("INSERT OR IGNORE INTO user_configs (discord_id, max_snipes, banned, is_mod, notif_limit, tts_enabled) VALUES (?, 10, 0, 0, 5, 0)", (str(user.id),))
         c.execute("UPDATE user_configs SET banned = 0 WHERE discord_id = ?", (str(user.id),))
         conn.commit()
     await interaction.response.send_message(f"✅ Unbanned {user.mention}.", ephemeral=True)
@@ -519,7 +529,7 @@ async def admin_set_mod(interaction: discord.Interaction, member: discord.User):
         return
     with sqlite3.connect(SQL_FILE) as conn:
         c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO user_configs (discord_id, max_snipes, banned, is_mod, notif_limit) VALUES (?, 10, 0, 0, 5)", (str(member.id),))
+        c.execute("INSERT OR IGNORE INTO user_configs (discord_id, max_snipes, banned, is_mod, notif_limit, tts_enabled) VALUES (?, 10, 0, 0, 5, 0)", (str(member.id),))
         c.execute("UPDATE user_configs SET is_mod = 1 WHERE discord_id = ?", (str(member.id),))
         conn.commit()
     await interaction.response.send_message(f"✅ Set {member.mention} as a mod.", ephemeral=True)
@@ -559,11 +569,15 @@ async def admin_list_mods(interaction: discord.Interaction):
     await interaction.response.send_message("**Mods:**\n" + "\n".join(lines), ephemeral=True)
 admin_list_mods.dm_permission = True
 
-@bot.tree.command(name="admin_status", description="Show bot status information (admin only).")
+@bot.tree.command(
+    name="admin_status", 
+    description="Show bot status information (admin only)."
+)
 @app_commands.check(admin_check)
 async def admin_status(interaction: discord.Interaction):
     status_message = await get_admin_status_message()
     await interaction.response.send_message(status_message, ephemeral=True)
+admin_status.default_member_permissions = discord.Permissions(administrator=True)
 admin_status.dm_permission = True
 
 @bot.tree.command(name="admin_toggle_scan_notify", description=f"Toggle API scan notifications for admin (with a {ADMIN_SCAN_NOTIFY_COOLDOWN}-second cooldown).")
@@ -580,7 +594,6 @@ async def admin_global_snipe(interaction: discord.Interaction, enable: bool):
     global GLOBAL_SNIPING_ENABLED, ADMIN_GLOBAL_LAST_OPEN_STATUS
     GLOBAL_SNIPING_ENABLED = enable
     if enable:
-        # Record current open status so you won't be notified for already open courses.
         courses = get_cached_courses()
         for course in courses:
             for section in course.get("sections", []):
@@ -616,7 +629,6 @@ admin_show_banned.dm_permission = True
 @app_commands.check(admin_check)
 async def admin_set_ram(interaction: discord.Interaction, megabytes: int):
     global allocated_memory
-    # Clear any previous allocation
     allocated_memory.clear()
     try:
         block = "X" * (1024 * 1024)  # ~1 MB block
@@ -664,7 +676,6 @@ admin_help.dm_permission = True
 
 @bot.command(name="admin_status")
 async def admin_status_prefix(ctx):
-    # Basic admin check for prefix command
     if str(ctx.author.id) != ADMIN_ID:
         await ctx.send("❌ You don't have permission to use this command.")
         return
@@ -679,7 +690,6 @@ async def admin_status_prefix(ctx):
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
     await initialize_storage()
-    # Sync slash commands with Discord
     try:
         synced = await bot.tree.sync()
         print(f"🚀 Synced {len(synced)} slash command(s).")
