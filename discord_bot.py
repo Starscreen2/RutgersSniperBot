@@ -9,34 +9,26 @@ from discord import app_commands
 from discord.ext import commands
 from typing import Optional
 
-# Bot Token and settings
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 SQL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "snipes.db")
 RUTGERS_API_URL = "https://sis.rutgers.edu/soc/api/courses.json?year=2025&term=7&campus=NB"
-SCAN_INTERVAL = 1  # Check continuously
+SCAN_INTERVAL = 1 #checks every second
 
-# Global cache for courses
 COURSE_CACHE = {"timestamp": 0, "data": None}
-CACHE_DURATION = 60  # in seconds
+CACHE_DURATION = 60  
 
-# Fixed admin ID (make sure this is your Discord ID)
-ADMIN_ID = "488372822788276225"
+ADMIN_ID = "admin_id"
 
-# Global admin sniping variables
 GLOBAL_SNIPING_ENABLED = False
-# Tracks the last open state of each course section (so notifications are sent only on transition)
 ADMIN_GLOBAL_LAST_OPEN_STATUS = {}
 
-# Global scan notification variables (for admin)
 ADMIN_SCAN_NOTIFY = False
 ADMIN_SCAN_LAST_NOTIFIED = 0
-ADMIN_SCAN_NOTIFY_COOLDOWN = 60  # seconds
+ADMIN_SCAN_NOTIFY_COOLDOWN = 60 
 
-# Global variable to hold artificially allocated memory blocks.
-# Each block will be a string of ~1 MB.
+
 allocated_memory = []
 
-# Discord bot setup (using Intents and a command tree)
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -49,7 +41,6 @@ async def initialize_storage():
     os.makedirs("data", exist_ok=True)
     with sqlite3.connect(SQL_FILE) as conn:
         c = conn.cursor()
-        # Table for user snipes
         c.execute("""
             CREATE TABLE IF NOT EXISTS snipes (
                 discord_id TEXT,
@@ -58,7 +49,6 @@ async def initialize_storage():
                 UNIQUE(discord_id, index_number)
             )
         """)
-        # Create the user_configs table if it doesn't exist (including notif_limit and tts_enabled)
         c.execute("""
             CREATE TABLE IF NOT EXISTS user_configs (
                 discord_id TEXT PRIMARY KEY,
@@ -69,7 +59,6 @@ async def initialize_storage():
                 tts_enabled INTEGER DEFAULT 0
             )
         """)
-        # Check if notif_limit column exists; if not, add it.
         c.execute("PRAGMA table_info(user_configs)")
         columns = [row[1] for row in c.fetchall()]
         if "notif_limit" not in columns:
@@ -131,11 +120,9 @@ def get_course_name(index_number):
 #########################################
 
 async def add_snipe(discord_id, index_number):
-    # Check user config and banned status
     max_snipes, banned, is_mod, notif_limit, tts_enabled = get_user_config(discord_id)
     if int(banned) == 1:
         return "banned"
-    # Enforce snipes limit (unless admin or mod)
     if discord_id != ADMIN_ID and int(is_mod) != 1:
         with sqlite3.connect(SQL_FILE) as conn:
             c = conn.cursor()
@@ -167,7 +154,6 @@ async def notify_users(index_number):
         users = c.fetchall()
 
         for user_id, sent_count in users:
-            # Retrieve the user's notification limit and TTS preference
             _, _, _, notif_limit, tts_enabled = get_user_config(user_id)
             if sent_count < notif_limit:
                 try:
@@ -208,7 +194,6 @@ async def check_courses():
                 tracked_courses = {row[0] for row in c.fetchall()}
 
             courses = await fetch_courses()
-            # Count open sections for scan notification
             open_sections = 0
             for course in courses:
                 for section in course.get("sections", []):
@@ -219,12 +204,10 @@ async def check_courses():
 
                     print(f"🔎 Course {index_number}: {status}")
 
-                    # Notify regular users if course is in their snipes and open.
                     if str(index_number) in tracked_courses and status == "TRUE":
                         print(f"✅ Course {index_number} is OPEN! Notifying users...")
                         await notify_users(index_number)
 
-                    # Global admin sniping: notify on state changes.
                     if GLOBAL_SNIPING_ENABLED:
                         course_key = str(index_number)
                         current_open = (status == "TRUE")
@@ -243,7 +226,6 @@ async def check_courses():
                             except Exception as e:
                                 print(f"❌ Failed to notify admin for course {index_number}: {e}")
                             ADMIN_GLOBAL_LAST_OPEN_STATUS[course_key] = current_open
-            # Admin scan notification (if enabled)
             if ADMIN_SCAN_NOTIFY:
                 now = time.time()
                 if now - ADMIN_SCAN_LAST_NOTIFIED >= ADMIN_SCAN_NOTIFY_COOLDOWN:
@@ -374,7 +356,6 @@ async def set_notif_limit(interaction: discord.Interaction, limit: int):
     await interaction.response.send_message(f"✅ {interaction.user.mention}, your notification limit has been set to {limit} per course.", ephemeral=True)
 set_notif_limit.dm_permission = True
 
-# New command: Toggle TTS for open section notifications
 @bot.tree.command(name="set_tts", description="Toggle TTS for open section notifications (default off).")
 async def set_tts(interaction: discord.Interaction, enable: bool):
     with sqlite3.connect(SQL_FILE) as conn:
